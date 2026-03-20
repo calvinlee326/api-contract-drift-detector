@@ -1,0 +1,37 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Ref Test", "version": "1.0.0" },
+  "components": {
+    "schemas": {
+      "Address": {
+        "type": "object",
+        "properties": {
+          "street": { "type": "string" },
+          "city":   { "type": "string" }
+        }
+      },
+      "Pet": {
+        "type": "object",
+        "properties": {
+          "name":    { "type": "string" },
+          "address": { "$ref": "#/components/schemas/Address" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/pets/{id}": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Pet" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

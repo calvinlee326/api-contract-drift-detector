@@ -52,8 +52,8 @@ def get_paths(spec: dict) -> dict:
     return spec.get("paths", {})
 
 
-def get_schema_ref(spec: dict, ref: str):
-    """Resolve a simple $ref like '#/components/schemas/Foo'."""
+def get_schema_ref(spec: dict, ref: str) -> dict:
+    """Resolve a $ref like '#/components/schemas/Foo' by walking the spec."""
     parts = ref.lstrip("#/").split("/")
     node = spec
     for p in parts:
@@ -61,11 +61,41 @@ def get_schema_ref(spec: dict, ref: str):
     return node
 
 
-def resolve(spec: dict, obj: dict) -> dict:
-    """Resolve $ref nodes one level deep."""
+def resolve(spec: dict, obj: dict, _seen: set | None = None) -> dict:
+    """Resolve a single $ref, following chains but guarding against circular refs."""
+    if not isinstance(obj, dict):
+        return obj
+    if "$ref" not in obj:
+        return obj
+    if _seen is None:
+        _seen = set()
+    ref = obj["$ref"]
+    if ref in _seen:
+        return {}  # circular — stop
+    _seen.add(ref)
+    resolved = get_schema_ref(spec, ref)
+    return resolve(spec, resolved, _seen)
+
+
+def expand(spec: dict, obj: dict, _seen: set | None = None) -> dict:
+    """Deeply expand all $ref nodes in a schema tree so deepdiff sees real values."""
+    if not isinstance(obj, dict):
+        return obj
+    if _seen is None:
+        _seen = set()
+
+    # Resolve the top-level ref first
     if "$ref" in obj:
-        return get_schema_ref(spec, obj["$ref"])
-    return obj
+        ref = obj["$ref"]
+        if ref in _seen:
+            return {}
+        _seen = _seen | {ref}
+        obj = get_schema_ref(spec, ref)
+        if not isinstance(obj, dict):
+            return obj
+
+    # Recursively expand every value in the dict
+    return {k: expand(spec, v, _seen) for k, v in obj.items()}
 
 
 def iter_operations(paths: dict):
@@ -80,17 +110,16 @@ def iter_operations(paths: dict):
 def get_response_schema(spec: dict, operation: dict) -> dict:
     """Extract the schema for the success response body (best-effort)."""
     responses = operation.get("responses", {})
-    ok = responses.get("200") or responses.get("201") or {}
-    ok = resolve(spec, ok)
+    ok = resolve(spec, responses.get("200") or responses.get("201") or {})
 
     # OpenAPI 3
     content = ok.get("content", {})
     for mime in ("application/json", "*/*"):
         if mime in content:
-            return resolve(spec, content[mime].get("schema", {}))
+            return expand(spec, content[mime].get("schema", {}))
 
     # Swagger 2
-    return resolve(spec, ok.get("schema", {}))
+    return expand(spec, ok.get("schema", {}))
 
 
 def get_request_body_schema(spec: dict, operation: dict) -> dict:
@@ -99,12 +128,12 @@ def get_request_body_schema(spec: dict, operation: dict) -> dict:
     content = rb.get("content", {})
     for mime in ("application/json", "*/*"):
         if mime in content:
-            return resolve(spec, content[mime].get("schema", {}))
+            return expand(spec, content[mime].get("schema", {}))
 
     for param in operation.get("parameters", []):
         param = resolve(spec, param)
         if param.get("in") == "body":
-            return resolve(spec, param.get("schema", {}))
+            return expand(spec, param.get("schema", {}))
 
     return {}
 
@@ -149,7 +178,7 @@ def classify_schema_changes(old_schema: dict, new_schema: dict, context: str, re
     if old_schema == new_schema:
         return
 
-    diff = DeepDiff(old_schema, new_schema, ignore_order=True, verbose_level=0)
+    diff = DeepDiff(old_schema, new_schema, ignore_order=True, verbose_level=2)
 
     for path in diff.get("dictionary_item_removed", []):
         field = _human_path(str(path))
@@ -305,6 +334,18 @@ def _group_by_endpoint(results: list[tuple[str, str]]) -> dict:
     return groups
 
 
+def output_json(results: list[tuple[str, str]]):
+    payload = {
+        "summary": {
+            "breaking":     sum(1 for r in results if r[0] == BREAKING),
+            "non_breaking": sum(1 for r in results if r[0] == NON_BREAKING),
+            "warnings":     sum(1 for r in results if r[0] == WARNING),
+        },
+        "changes": [{"severity": s, "message": m} for s, m in results],
+    }
+    print(json.dumps(payload, indent=2))
+
+
 def print_report(results: list[tuple[str, str]], use_color: bool = True):
     breaking     = [r for r in results if r[0] == BREAKING]
     non_breaking = [r for r in results if r[0] == NON_BREAKING]
@@ -378,12 +419,19 @@ Examples:
   python detector.py v1.yaml v2.yaml
   python detector.py https://api.example.com/v1/openapi.json v2.json
   python detector.py v1.json v2.json --no-color
+  python detector.py v1.json v2.json --output json
   python detector.py v1.json v2.json --exit-code
         """,
     )
     parser.add_argument("old", help="Path or URL to the OLD spec (baseline)")
     parser.add_argument("new", help="Path or URL to the NEW spec (candidate)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format: 'text' (default) or 'json' for machine-readable output",
+    )
     parser.add_argument(
         "--exit-code",
         action="store_true",
@@ -395,7 +443,11 @@ Examples:
     new_spec = load_spec(args.new)
 
     results = diff_specs(old_spec, new_spec)
-    print_report(results, use_color=not args.no_color)
+
+    if args.output == "json":
+        output_json(results)
+    else:
+        print_report(results, use_color=not args.no_color)
 
     if args.exit_code:
         sys.exit(1 if any(r[0] == BREAKING for r in results) else 0)
