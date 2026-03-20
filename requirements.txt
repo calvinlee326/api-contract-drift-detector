@@ -1,1 +1,2 @@
-deepdiff>=6.0
+deepdiff==8.6.2
+orderly-set==5.5.0
