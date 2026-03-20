@@ -114,32 +114,33 @@ def classify_schema_changes(old_schema: dict, new_schema: dict, context: str, re
 
     # Removed fields → breaking (consumers expect them)
     for path in diff.get("dictionary_item_removed", []):
-        key = _last_key(path)
-        # Removing a property from a response schema is breaking
-        severity = BREAKING
-        results.append((severity, f"{context}: field removed — {path}"))
+        field = _human_path(str(path))
+        results.append((BREAKING, f"{context}: field removed — '{field}'"))
 
     # Added fields → non-breaking (consumers can ignore them)
     for path in diff.get("dictionary_item_added", []):
-        results.append((NON_BREAKING, f"{context}: field added — {path}"))
+        field = _human_path(str(path))
+        results.append((NON_BREAKING, f"{context}: field added — '{field}'"))
 
     # Type changes → breaking
     for path, change in diff.get("type_changes", {}).items():
+        field = _human_path(path)
         results.append((BREAKING,
-            f"{context}: type changed {change['old_type'].__name__} → "
-            f"{change['new_type'].__name__} at {path}"))
+            f"{context}: type changed at '{field}' "
+            f"{change['old_type'].__name__} → {change['new_type'].__name__}"))
 
     # Value changes (e.g. "type": "string" → "integer") → breaking
     for path, change in diff.get("values_changed", {}).items():
         key = _last_key(path)
+        field = _human_path(path)
         if key in ("type", "format", "enum", "pattern", "minimum", "maximum",
                    "minLength", "maxLength", "minItems", "maxItems"):
             results.append((BREAKING,
-                f"{context}: constraint changed '{key}': "
+                f"{context}: '{field}' changed "
                 f"{change['old_value']!r} → {change['new_value']!r}"))
         else:
             results.append((NON_BREAKING,
-                f"{context}: value changed '{key}': "
+                f"{context}: '{field}' changed "
                 f"{change['old_value']!r} → {change['new_value']!r}"))
 
 
@@ -147,6 +148,13 @@ def _last_key(deepdiff_path: str) -> str:
     """Extract the last key name from a DeepDiff path string like root['foo']['bar']."""
     parts = deepdiff_path.replace("root", "").strip("[]").split("']['")
     return parts[-1].strip("'[]")
+
+
+def _human_path(deepdiff_path: str) -> str:
+    """Convert root['properties']['name']['type'] → properties.name.type"""
+    import re
+    keys = re.findall(r"\['([^']+)'\]", deepdiff_path)
+    return ".".join(keys) if keys else deepdiff_path
 
 
 # ──────────────────────────────────────────────
@@ -250,6 +258,22 @@ BOLD  = "\033[1m"
 RESET = "\033[0m"
 
 
+def _group_by_endpoint(results: list[tuple[str, str]]) -> dict:
+    """
+    Group results by endpoint label.
+    Endpoint-level messages (e.g. 'Endpoint removed') get key '_global'.
+    Operation messages (e.g. 'GET /pets [response]: ...') are grouped by 'METHOD /path'.
+    """
+    import re
+    groups = {}
+    for severity, msg in results:
+        # Match messages that start with an HTTP method + path
+        m = re.match(r"^((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) [^\s:\[]+)", msg)
+        key = m.group(1) if m else "_global"
+        groups.setdefault(key, []).append((severity, msg))
+    return groups
+
+
 def print_report(results: list[tuple[str, str]], use_color: bool = True):
     breaking = [r for r in results if r[0] == BREAKING]
     non_breaking = [r for r in results if r[0] == NON_BREAKING]
@@ -268,24 +292,36 @@ def print_report(results: list[tuple[str, str]], use_color: bool = True):
         print()
         return
 
-    print(c(f"  {len(breaking)} breaking change(s)  |  {len(non_breaking)} non-breaking change(s)", BOLD))
+    print(c(f"  {len(breaking)} breaking  |  {len(non_breaking)} non-breaking", BOLD))
     print()
 
-    if breaking:
-        print(c(f"BREAKING CHANGES ({len(breaking)})", RED))
-        print(c("-" * 40, RED))
-        for _, msg in breaking:
-            print(c(f"  ✗ {msg}", RED))
+    groups = _group_by_endpoint(results)
+
+    # Global messages first (endpoint added/removed)
+    global_items = groups.pop("_global", [])
+    if global_items:
+        print(c("GLOBAL", BOLD))
+        print(c("-" * 40, BOLD))
+        for severity, msg in global_items:
+            icon = "✗" if severity == BREAKING else "✓"
+            color = RED if severity == BREAKING else GREEN
+            print(c(f"  {icon} {msg}", color))
         print()
 
-    if non_breaking:
-        print(c(f"NON-BREAKING CHANGES ({len(non_breaking)})", GREEN))
-        print(c("-" * 40, GREEN))
-        for _, msg in non_breaking:
-            print(c(f"  ✓ {msg}", GREEN))
+    # Per-endpoint groups
+    for endpoint, items in sorted(groups.items()):
+        has_breaking = any(s == BREAKING for s, _ in items)
+        header_color = RED if has_breaking else GREEN
+        print(c(endpoint, header_color + BOLD))
+        print(c("-" * 40, header_color))
+        for severity, msg in items:
+            # Strip the endpoint prefix from the message for cleaner display
+            detail = msg[len(endpoint):].lstrip(": ")
+            icon = "✗" if severity == BREAKING else "✓"
+            color = RED if severity == BREAKING else GREEN
+            print(c(f"  {icon} {detail}", color))
         print()
 
-    # Exit code hint
     print(c("=" * 60, BOLD))
     if breaking:
         print(c("  Result: BREAKING — review before deploying.", RED))
